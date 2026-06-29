@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from env import AttrDict
 from models import Generator
-from meldataset import MAX_WAV_VALUE
+from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
 
 
 def load_checkpoint(filepath, device):
@@ -17,6 +17,10 @@ def load_checkpoint(filepath, device):
     checkpoint_dict = torch.load(filepath, map_location=device)
     print("Complete.")
     return checkpoint_dict
+
+
+def get_mel(x):
+    return mel_spectrogram(x, h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax)
 
 
 def hann_window(length):
@@ -84,33 +88,61 @@ def chunked_inference_file(generator, x_np, h, device, chunk_frames=128, overlap
     return audio
 
 
+def inference_mel_file(generator, mel_file, output_dir, chunk_frames, overlap_frames):
+    x = np.load(mel_file)
+    audio = chunked_inference_file(generator, x, h, device, chunk_frames, overlap_frames)
+
+    from scipy.io.wavfile import write
+    output_file = os.path.join(output_dir, os.path.splitext(os.path.basename(mel_file))[0] + '_stream_generated.wav')
+    write(output_file, h.sampling_rate, audio)
+    print(output_file)
+
+
+def inference_wav_file(generator, wav_file, output_dir, chunk_frames, overlap_frames):
+    wav, sr = load_wav(wav_file)
+    wav = wav / MAX_WAV_VALUE
+    wav = torch.FloatTensor(wav).to(device)
+    x = get_mel(wav.unsqueeze(0)).cpu().numpy()
+    audio = chunked_inference_file(generator, x, h, device, chunk_frames, overlap_frames)
+
+    from scipy.io.wavfile import write
+    output_file = os.path.join(output_dir, os.path.splitext(os.path.basename(wav_file))[0] + '_stream_generated.wav')
+    write(output_file, h.sampling_rate, audio)
+    print(output_file)
+
+
 def inference(a):
     generator = Generator(h).to(device)
 
     state_dict_g = load_checkpoint(a.checkpoint_file, device)
     generator.load_state_dict(state_dict_g['generator'])
 
-    filelist = sorted(os.listdir(a.input_mels_dir))
     os.makedirs(a.output_dir, exist_ok=True)
 
     generator.eval()
     generator.remove_weight_norm()
 
-    for filname in filelist:
-        if not filname.lower().endswith('.npy'):
-            continue
-        x = np.load(os.path.join(a.input_mels_dir, filname))
-        audio = chunked_inference_file(generator, x, h, device, a.chunk_frames, a.overlap_frames)
-
-        from scipy.io.wavfile import write
-        output_file = os.path.join(a.output_dir, os.path.splitext(filname)[0] + '_stream_generated.wav')
-        write(output_file, h.sampling_rate, audio)
-        print(output_file)
+    if a.input_wavs_dir:
+        filelist = sorted(os.listdir(a.input_wavs_dir))
+        for filname in filelist:
+            if not filname.lower().endswith('.wav'):
+                continue
+            inference_wav_file(generator, os.path.join(a.input_wavs_dir, filname), a.output_dir,
+                               a.chunk_frames, a.overlap_frames)
+    else:
+        filelist = sorted(os.listdir(a.input_mels_dir))
+        for filname in filelist:
+            if not filname.lower().endswith('.npy'):
+                continue
+            inference_mel_file(generator, os.path.join(a.input_mels_dir, filname), a.output_dir,
+                               a.chunk_frames, a.overlap_frames)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_mels_dir', default='test_mel_files')
+    parser.add_argument('--input_wavs_dir', default=None,
+                        help='Directory containing wav files. If set, wav input is used instead of mel input.')
     parser.add_argument('--output_dir', default='generated_stream')
     parser.add_argument('--checkpoint_file', required=True)
     parser.add_argument('--chunk_frames', default=128, type=int,
