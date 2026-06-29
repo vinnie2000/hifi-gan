@@ -1,0 +1,19 @@
+# Enforce LF line endings for text files to avoid cross-platform diffs
+*.py    text eol=lf
+*.txt   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.sh    text eol=lf
+*.ini   text eol=lf
+*.cfg   text eol=lf
+
+# Keep binary files unchanged
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.wav   binary
+*.pt    binary
+*.pth   binary
+*.ckpt  binary

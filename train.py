@@ -22,6 +22,7 @@ torch.backends.cudnn.benchmark = True
 
 
 def train(rank, a, h):
+    # In distributed training, each spawned process owns one GPU and gets a unique rank.
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
                            world_size=h.dist_config['world_size'] * h.num_gpus, rank=rank)
@@ -29,15 +30,18 @@ def train(rank, a, h):
     torch.cuda.manual_seed(h.seed)
     device = torch.device('cuda:{:d}'.format(rank))
 
+    # Build the generator and the two HiFi-GAN discriminators.
     generator = Generator(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
 
+    # Rank 0 is the main process responsible for printing, logging, validation, and checkpoints.
     if rank == 0:
         print(generator)
         os.makedirs(a.checkpoint_path, exist_ok=True)
         print("checkpoints directory : ", a.checkpoint_path)
 
+    # Resume from the latest generator and discriminator/optimizer checkpoints if present.
     if os.path.isdir(a.checkpoint_path):
         cp_g = scan_checkpoint(a.checkpoint_path, 'g_')
         cp_do = scan_checkpoint(a.checkpoint_path, 'do_')
@@ -60,6 +64,7 @@ def train(rank, a, h):
         mpd = DistributedDataParallel(mpd, device_ids=[rank]).to(device)
         msd = DistributedDataParallel(msd, device_ids=[rank]).to(device)
 
+    # Generator and discriminators use separate AdamW optimizers.
     optim_g = torch.optim.AdamW(generator.parameters(), h.learning_rate, betas=[h.adam_b1, h.adam_b2])
     optim_d = torch.optim.AdamW(itertools.chain(msd.parameters(), mpd.parameters()),
                                 h.learning_rate, betas=[h.adam_b1, h.adam_b2])
@@ -68,9 +73,11 @@ def train(rank, a, h):
         optim_g.load_state_dict(state_dict_do['optim_g'])
         optim_d.load_state_dict(state_dict_do['optim_d'])
 
+    # Decay generator and discriminator learning rates exponentially after each epoch.
     scheduler_g = torch.optim.lr_scheduler.ExponentialLR(optim_g, gamma=h.lr_decay, last_epoch=last_epoch)
     scheduler_d = torch.optim.lr_scheduler.ExponentialLR(optim_d, gamma=h.lr_decay, last_epoch=last_epoch)
 
+    # Training samples are random fixed-length waveform segments with matching mel features.
     training_filelist, validation_filelist = get_dataset_filelist(a)
 
     trainset = MelDataset(training_filelist, h.segment_size, h.n_fft, h.num_mels,
@@ -102,6 +109,8 @@ def train(rank, a, h):
     generator.train()
     mpd.train()
     msd.train()
+
+    # Main training loop: one epoch iterates once over the training DataLoader.
     for epoch in range(max(0, last_epoch), a.training_epochs):
         if rank == 0:
             start = time.time()
@@ -119,10 +128,12 @@ def train(rank, a, h):
             y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
             y = y.unsqueeze(1)
 
+            # Generate waveform from mel input, then compute mel features for the generated audio.
             y_g_hat = generator(x)
             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
                                           h.fmin, h.fmax_for_loss)
 
+            # Update discriminators first. Detach generated audio so gradients do not flow into the generator.
             optim_d.zero_grad()
 
             # MPD
@@ -138,7 +149,7 @@ def train(rank, a, h):
             loss_disc_all.backward()
             optim_d.step()
 
-            # Generator
+            # Update generator using mel loss, adversarial loss, and discriminator feature matching loss.
             optim_g.zero_grad()
 
             # L1 Mel-Spectrogram Loss
@@ -156,7 +167,7 @@ def train(rank, a, h):
             optim_g.step()
 
             if rank == 0:
-                # STDOUT logging
+                # Print lightweight progress logs.
                 if steps % a.stdout_interval == 0:
                     with torch.no_grad():
                         mel_error = F.l1_loss(y_mel, y_g_hat_mel).item()
@@ -164,7 +175,7 @@ def train(rank, a, h):
                     print('Steps : {:d}, Gen Loss Total : {:4.3f}, Mel-Spec. Error : {:4.3f}, s/b : {:4.3f}'.
                           format(steps, loss_gen_all, mel_error, time.time() - start_b))
 
-                # checkpointing
+                # Save generator separately from discriminators and optimizer state.
                 if steps % a.checkpoint_interval == 0 and steps != 0:
                     checkpoint_path = "{}/g_{:08d}".format(a.checkpoint_path, steps)
                     save_checkpoint(checkpoint_path,
@@ -178,12 +189,12 @@ def train(rank, a, h):
                                      'optim_g': optim_g.state_dict(), 'optim_d': optim_d.state_dict(), 'steps': steps,
                                      'epoch': epoch})
 
-                # Tensorboard summary logging
+                # Write scalar training metrics to TensorBoard.
                 if steps % a.summary_interval == 0:
                     sw.add_scalar("training/gen_loss_total", loss_gen_all, steps)
                     sw.add_scalar("training/mel_spec_error", mel_error, steps)
 
-                # Validation
+                # Run validation on full validation samples and log audio/spectrogram examples.
                 if steps % a.validation_interval == 0:  # and steps != 0:
                     generator.eval()
                     torch.cuda.empty_cache()
@@ -217,6 +228,7 @@ def train(rank, a, h):
 
             steps += 1
 
+        # Decay learning rates once per epoch.
         scheduler_g.step()
         scheduler_d.step()
         

@@ -5,7 +5,6 @@ import os
 import argparse
 import json
 import torch
-from scipy.io.wavfile import write
 from env import AttrDict
 from meldataset import mel_spectrogram, MAX_WAV_VALUE, load_wav
 from models import Generator
@@ -35,6 +34,8 @@ def scan_checkpoint(cp_dir, prefix):
 
 
 def inference(a):
+    from scipy.io.wavfile import write
+
     generator = Generator(h).to(device)
 
     state_dict_g = load_checkpoint(a.checkpoint_file, device)

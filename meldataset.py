@@ -4,14 +4,13 @@ import random
 import torch
 import torch.utils.data
 import numpy as np
-from librosa.util import normalize
-from scipy.io.wavfile import read
-from librosa.filters import mel as librosa_mel_fn
 
 MAX_WAV_VALUE = 32768.0
 
 
 def load_wav(full_path):
+    from scipy.io.wavfile import read
+
     sampling_rate, data = read(full_path)
     return data, sampling_rate
 
@@ -46,6 +45,72 @@ mel_basis = {}
 hann_window = {}
 
 
+def _hz_to_mel(frequencies):
+    frequencies = np.asanyarray(frequencies)
+    f_min = 0.0
+    f_sp = 200.0 / 3
+    mels = (frequencies - f_min) / f_sp
+
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+
+    if frequencies.ndim:
+        log_t = frequencies >= min_log_hz
+        mels[log_t] = min_log_mel + np.log(frequencies[log_t] / min_log_hz) / logstep
+    elif frequencies >= min_log_hz:
+        mels = min_log_mel + np.log(frequencies / min_log_hz) / logstep
+
+    return mels
+
+
+def _mel_to_hz(mels):
+    mels = np.asanyarray(mels)
+    f_min = 0.0
+    f_sp = 200.0 / 3
+    freqs = f_min + f_sp * mels
+
+    min_log_hz = 1000.0
+    min_log_mel = (min_log_hz - f_min) / f_sp
+    logstep = np.log(6.4) / 27.0
+
+    if mels.ndim:
+        log_t = mels >= min_log_mel
+        freqs[log_t] = min_log_hz * np.exp(logstep * (mels[log_t] - min_log_mel))
+    elif mels >= min_log_mel:
+        freqs = min_log_hz * np.exp(logstep * (mels - min_log_mel))
+
+    return freqs
+
+
+def mel_filter_bank(sampling_rate, n_fft, num_mels, fmin, fmax):
+    if fmax is None:
+        fmax = float(sampling_rate) / 2
+
+    mel_min = _hz_to_mel(fmin)
+    mel_max = _hz_to_mel(fmax)
+    mel_points = np.linspace(mel_min, mel_max, num_mels + 2)
+    hz_points = _mel_to_hz(mel_points)
+    fft_freqs = np.linspace(0, float(sampling_rate) / 2, 1 + n_fft // 2)
+
+    fdiff = np.diff(hz_points)
+    ramps = hz_points[:, np.newaxis] - fft_freqs[np.newaxis, :]
+    lower = -ramps[:-2] / fdiff[:-1, np.newaxis]
+    upper = ramps[2:] / fdiff[1:, np.newaxis]
+
+    weights = np.maximum(0, np.minimum(lower, upper))
+    enorm = 2.0 / (hz_points[2:num_mels + 2] - hz_points[:num_mels])
+    weights *= enorm[:, np.newaxis]
+    return weights.astype(np.float32)
+
+
+def normalize(audio):
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        return audio / peak
+    return audio
+
+
 def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin, fmax, center=False):
     if torch.min(y) < -1.:
         print('min value is ', torch.min(y))
@@ -53,20 +118,25 @@ def mel_spectrogram(y, n_fft, num_mels, sampling_rate, hop_size, win_size, fmin,
         print('max value is ', torch.max(y))
 
     global mel_basis, hann_window
-    if fmax not in mel_basis:
-        mel = librosa_mel_fn(sampling_rate, n_fft, num_mels, fmin, fmax)
-        mel_basis[str(fmax)+'_'+str(y.device)] = torch.from_numpy(mel).float().to(y.device)
+    mel_key = str(fmax)+'_'+str(y.device)
+    if mel_key not in mel_basis:
+        mel = mel_filter_bank(sampling_rate, n_fft, num_mels, fmin, fmax)
+        mel_basis[mel_key] = torch.from_numpy(mel).float().to(y.device)
         hann_window[str(y.device)] = torch.hann_window(win_size).to(y.device)
 
     y = torch.nn.functional.pad(y.unsqueeze(1), (int((n_fft-hop_size)/2), int((n_fft-hop_size)/2)), mode='reflect')
     y = y.squeeze(1)
 
-    spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
-                      center=center, pad_mode='reflect', normalized=False, onesided=True)
+    try:
+        spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
+                          center=center, pad_mode='reflect', normalized=False, onesided=True, return_complex=False)
+    except TypeError:
+        spec = torch.stft(y, n_fft, hop_length=hop_size, win_length=win_size, window=hann_window[str(y.device)],
+                          center=center, pad_mode='reflect', normalized=False, onesided=True)
 
     spec = torch.sqrt(spec.pow(2).sum(-1)+(1e-9))
 
-    spec = torch.matmul(mel_basis[str(fmax)+'_'+str(y.device)], spec)
+    spec = torch.matmul(mel_basis[mel_key], spec)
     spec = spectral_normalize_torch(spec)
 
     return spec
