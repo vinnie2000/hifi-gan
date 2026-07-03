@@ -12,6 +12,7 @@ import torch
 from env import AttrDict
 from meldataset import MAX_WAV_VALUE, load_wav, mel_spectrogram
 from models import Generator
+from stream_inference import StreamingHiFiGAN, normalize_mel
 
 
 def load_config(config_file):
@@ -75,13 +76,29 @@ def estimate_flops(model, mel_shape, device):
     return flops['total']
 
 
-def estimate_chunked_flops(model, h, mel_frames, chunk_frames, overlap_frames, device):
+def estimate_streaming_flops(model, h, mel_frames, chunk_frames, context_frames, device):
     total_flops = 0
-    step = max(1, chunk_frames - overlap_frames)
-    for start in range(0, mel_frames, step):
-        s = max(0, start - overlap_frames)
-        e = min(mel_frames, start + chunk_frames + overlap_frames)
-        total_flops += estimate_flops(model, (1, h.num_mels, e - s), device)
+    buffer_start_frame = 0
+    buffer_end_frame = 0
+    emitted_until_frame = 0
+
+    for start in range(0, mel_frames, chunk_frames):
+        end = min(mel_frames, start + chunk_frames)
+        buffer_end_frame += end - start
+        emit_end_frame = max(emitted_until_frame, buffer_end_frame - context_frames)
+        if emit_end_frame > emitted_until_frame:
+            gen_start_frame = max(buffer_start_frame, emitted_until_frame - context_frames)
+            gen_end_frame = min(buffer_end_frame, emit_end_frame + context_frames)
+            total_flops += estimate_flops(model, (1, h.num_mels, gen_end_frame - gen_start_frame), device)
+            emitted_until_frame = emit_end_frame
+
+        keep_from_frame = max(buffer_start_frame, emitted_until_frame - context_frames)
+        buffer_start_frame = keep_from_frame
+
+    if buffer_end_frame > emitted_until_frame:
+        gen_start_frame = max(buffer_start_frame, emitted_until_frame - context_frames)
+        gen_end_frame = buffer_end_frame
+        total_flops += estimate_flops(model, (1, h.num_mels, gen_end_frame - gen_start_frame), device)
     return total_flops
 
 
@@ -105,54 +122,35 @@ def full_inference(generator, mel):
     return audio.cpu().numpy().astype('int16')
 
 
-def chunked_inference(generator, mel_np, h, device, chunk_frames, overlap_frames):
-    if mel_np.ndim == 2:
-        mel_np = mel_np[np.newaxis, ...]
-    if mel_np.ndim == 3 and mel_np.shape[0] != 1:
-        mel_np = mel_np[0:1]
-
-    x = torch.FloatTensor(mel_np).to(device)
-    _, _, T = x.shape
-
-    hop = h.hop_size
-    total_samples = int(T * hop)
-    out = np.zeros(total_samples, dtype=np.float32)
-    weight = np.zeros(total_samples, dtype=np.float32)
-    step = max(1, chunk_frames - overlap_frames)
+def streaming_inference(generator, mel_np, h, device, chunk_frames, context_frames):
+    mel_np = normalize_mel(mel_np)
+    streamer = StreamingHiFiGAN(generator, h, device, context_frames)
+    chunks = []
     first_chunk_latency = None
 
-    for start in range(0, T, step):
-        s = max(0, start - overlap_frames)
-        e = min(T, start + chunk_frames + overlap_frames)
-        chunk = x[:, :, s:e]
-
+    for start in range(0, mel_np.shape[-1], chunk_frames):
+        end = min(mel_np.shape[-1], start + chunk_frames)
         sync(device)
         t0 = time.perf_counter()
-        with torch.no_grad():
-            y = generator(chunk)
+        audio_chunk = streamer.push(mel_np[:, :, start:end])
         sync(device)
-        if first_chunk_latency is None:
+        if first_chunk_latency is None and len(audio_chunk) > 0:
             first_chunk_latency = time.perf_counter() - t0
+        chunks.append(audio_chunk)
 
-        y = y.squeeze(0).squeeze(0).cpu().numpy()
-        start_sample = int(s * hop)
-        end_sample = start_sample + y.shape[0]
+    sync(device)
+    t0 = time.perf_counter()
+    tail = streamer.flush()
+    sync(device)
+    if first_chunk_latency is None and len(tail) > 0:
+        first_chunk_latency = time.perf_counter() - t0
+    chunks.append(tail)
 
-        L = y.shape[0]
-        win = np.ones(L, dtype=np.float32)
-        ov_samp = int(overlap_frames * hop)
-        if s > 0 and ov_samp > 0:
-            win[:ov_samp] = np.linspace(0.0, 1.0, ov_samp, endpoint=False, dtype=np.float32)
-        if e < T and ov_samp > 0:
-            win[-ov_samp:] = np.linspace(1.0, 0.0, ov_samp, endpoint=False, dtype=np.float32)
-
-        out[start_sample:end_sample] += y * win
-        weight[start_sample:end_sample] += win
-
-    nonzero = weight > 1e-8
-    out[nonzero] = out[nonzero] / weight[nonzero]
-    out = np.clip(out, -1.0, 1.0)
-    audio = (out * MAX_WAV_VALUE).astype('int16')
+    if chunks:
+        out = np.concatenate(chunks)
+    else:
+        out = np.zeros(0, dtype=np.float32)
+    audio = (np.clip(out, -1.0, 1.0) * MAX_WAV_VALUE).astype('int16')
     return audio, first_chunk_latency
 
 
@@ -200,14 +198,14 @@ def measure_full(generator, wav_tensor, h, device, warmup, runs):
         'latency_sec': float(np.mean(vocoder_times)),
         'peak_allocated_mb': None if peak_memory[0] is None else float(np.max(peak_memory)),
         'output_duration_sec': len(audio) / h.sampling_rate,
-    }
+    }, audio
 
 
-def measure_chunked(generator, wav_tensor, h, device, chunk_frames, overlap_frames, warmup, runs):
+def measure_streaming(generator, wav_tensor, h, device, chunk_frames, context_frames, warmup, runs):
     for _ in range(warmup):
         mel = get_mel(wav_tensor, h)
         mel_np = mel.cpu().numpy()
-        chunked_inference(generator, mel_np, h, device, chunk_frames, overlap_frames)
+        streaming_inference(generator, mel_np, h, device, chunk_frames, context_frames)
 
     total_times = []
     vocoder_times = []
@@ -223,8 +221,8 @@ def measure_chunked(generator, wav_tensor, h, device, chunk_frames, overlap_fram
         mel_np = mel.cpu().numpy()
         sync(device)
         vocoder_start = time.perf_counter()
-        audio, first_chunk_latency = chunked_inference(generator, mel_np, h, device,
-                                                       chunk_frames, overlap_frames)
+        audio, first_chunk_latency = streaming_inference(generator, mel_np, h, device,
+                                                         chunk_frames, context_frames)
         sync(device)
         vocoder_time = time.perf_counter() - vocoder_start
         total_time = time.perf_counter() - total_start
@@ -239,7 +237,7 @@ def measure_chunked(generator, wav_tensor, h, device, chunk_frames, overlap_fram
         'latency_sec': float(np.mean(latencies)),
         'peak_allocated_mb': None if peak_memory[0] is None else float(np.max(peak_memory)),
         'output_duration_sec': len(audio) / h.sampling_rate,
-    }
+    }, audio
 
 
 def build_model_specs(args):
@@ -260,7 +258,7 @@ def format_value(value):
 
 def print_rows(rows):
     columns = [
-        'model', 'method', 'chunk_frames', 'overlap_frames', 'params',
+        'model', 'method', 'chunk_frames', 'context_frames', 'params',
         'flops', 'total_time_sec', 'vocoder_time_sec', 'latency_sec',
         'rtf', 'peak_allocated_mb', 'output_duration_sec'
     ]
@@ -279,7 +277,7 @@ def write_csv(rows, csv_file):
     if not csv_file:
         return
     columns = [
-        'model', 'method', 'chunk_frames', 'overlap_frames', 'params',
+        'model', 'method', 'chunk_frames', 'context_frames', 'params',
         'flops', 'total_time_sec', 'vocoder_time_sec', 'latency_sec',
         'rtf', 'peak_allocated_mb', 'output_duration_sec'
     ]
@@ -290,14 +288,25 @@ def write_csv(rows, csv_file):
             writer.writerow(row)
 
 
+def write_audio(output_dir, model_name, method, sampling_rate, audio):
+    if not output_dir or audio is None:
+        return
+    from scipy.io.wavfile import write
+    os.makedirs(output_dir, exist_ok=True)
+    output_file = os.path.join(output_dir, '{}_{}.wav'.format(model_name, method))
+    write(output_file, sampling_rate, audio)
+    print(output_file)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_wav', required=True)
     parser.add_argument('--chunk_frames', default=128, type=int)
-    parser.add_argument('--overlap_frames', default=32, type=int)
+    parser.add_argument('--context_frames', default=32, type=int)
     parser.add_argument('--warmup', default=2, type=int)
     parser.add_argument('--runs', default=5, type=int)
     parser.add_argument('--csv_file', default=None)
+    parser.add_argument('--output_dir', default=None)
     parser.add_argument('--v1_config', default='config_v1.json')
     parser.add_argument('--v2_config', default='config_v2.json')
     parser.add_argument('--v3_config', default='config_v3.json')
@@ -305,6 +314,7 @@ def main():
     parser.add_argument('--v2_checkpoint', default=None)
     parser.add_argument('--v3_checkpoint', default=None)
     args = parser.parse_args()
+    context_frames = args.context_frames
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     wav, sr = load_wav(args.input_wav)
@@ -322,14 +332,14 @@ def main():
         params = parameter_count(generator)
         mel_frames = get_mel(wav_tensor, h).shape[-1]
         full_flops = estimate_flops(generator, (1, h.num_mels, mel_frames), device)
-        chunked_flops = estimate_chunked_flops(generator, h, mel_frames, args.chunk_frames,
-                                               args.overlap_frames, device)
+        streaming_flops = estimate_streaming_flops(generator, h, mel_frames, args.chunk_frames,
+                                                   context_frames, device)
 
         full_row = {
             'model': model_name,
             'method': 'full',
             'chunk_frames': None,
-            'overlap_frames': None,
+            'context_frames': None,
             'params': params,
             'flops': full_flops,
             'total_time_sec': None,
@@ -339,13 +349,13 @@ def main():
             'peak_allocated_mb': None,
             'output_duration_sec': None,
         }
-        chunked_row = {
+        streaming_row = {
             'model': model_name,
-            'method': 'chunked',
+            'method': 'streaming',
             'chunk_frames': args.chunk_frames,
-            'overlap_frames': args.overlap_frames,
+            'context_frames': context_frames,
             'params': params,
-            'flops': chunked_flops,
+            'flops': streaming_flops,
             'total_time_sec': None,
             'vocoder_time_sec': None,
             'latency_sec': None,
@@ -355,17 +365,19 @@ def main():
         }
 
         if checkpoint_file:
-            full = measure_full(generator, wav_tensor, h, device, args.warmup, args.runs)
+            full, full_audio = measure_full(generator, wav_tensor, h, device, args.warmup, args.runs)
             full['rtf'] = full['total_time_sec'] / full['output_duration_sec']
             full_row.update(full)
+            write_audio(args.output_dir, model_name, 'full', h.sampling_rate, full_audio)
 
-            chunked = measure_chunked(generator, wav_tensor, h, device, args.chunk_frames,
-                                      args.overlap_frames, args.warmup, args.runs)
-            chunked['rtf'] = chunked['total_time_sec'] / chunked['output_duration_sec']
-            chunked_row.update(chunked)
+            streaming, streaming_audio = measure_streaming(generator, wav_tensor, h, device, args.chunk_frames,
+                                                           context_frames, args.warmup, args.runs)
+            streaming['rtf'] = streaming['total_time_sec'] / streaming['output_duration_sec']
+            streaming_row.update(streaming)
+            write_audio(args.output_dir, model_name, 'streaming', h.sampling_rate, streaming_audio)
 
         rows.append(full_row)
-        rows.append(chunked_row)
+        rows.append(streaming_row)
 
     print_rows(rows)
     write_csv(rows, args.csv_file)
